@@ -1,4 +1,5 @@
 import datasets
+from datasets import Features, Value, ClassLabel
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, \
     AutoModelForQuestionAnswering, Trainer, TrainingArguments, HfArgumentParser
 import evaluate
@@ -6,6 +7,8 @@ from helpers import prepare_dataset_nli, prepare_train_dataset_qa, \
     prepare_validation_dataset_qa, QuestionAnsweringTrainer, compute_accuracy
 import os
 import json
+from train import train_model, train_model_cartography
+
 
 NUM_PREPROCESSING_WORKERS = 2
 
@@ -109,7 +112,20 @@ def main():
     train_dataset_featurized = None
     eval_dataset_featurized = None
     if training_args.do_train:
+        contrast_set = datasets.load_dataset('json', data_files='contrast_set.json')['train']
+        snli_label_class = ClassLabel(names=["entailment", "neutral", "contradiction"])
+        contrast_set = contrast_set.cast(
+        Features({
+            "premise": Value("string"),
+            "hypothesis": Value("string"),
+            "label": snli_label_class  # Convert to ClassLabel
+        })
+        )
+        print(contrast_set.features)
         train_dataset = dataset['train']
+        print(train_dataset)
+        train_dataset = datasets.concatenate_datasets([train_dataset, contrast_set])
+        train_dataset = train_dataset.shuffle(seed=42)
         if args.max_train_samples:
             train_dataset = train_dataset.select(range(args.max_train_samples))
         train_dataset_featurized = train_dataset.map(
@@ -166,7 +182,16 @@ def main():
     )
     # Train and/or evaluate
     if training_args.do_train:
-        trainer.train()
+        # trainer.train()
+        trainer = train_model_cartography(
+            model=model,
+            tokenizer=tokenizer,
+            train_dataset=train_dataset_featurized,
+            eval_dataset=eval_dataset_featurized,
+            training_args=training_args,  # Pass this instead of hardcoding in `train.py`
+            compute_metrics=compute_metrics,
+        )
+
         trainer.save_model()
         # If you want to customize the way the loss is computed, you should subclass Trainer and override the "compute_loss"
         # method (see https://huggingface.co/transformers/_modules/transformers/trainer.html#Trainer.compute_loss).
@@ -177,6 +202,7 @@ def main():
 
     if training_args.do_eval:
         results = trainer.evaluate(**eval_kwargs)
+        errors = []
 
         # To add custom metrics, you should replace the "compute_metrics" function (see comments above).
         #
@@ -208,7 +234,13 @@ def main():
                     example_with_prediction['predicted_label'] = int(eval_predictions.predictions[i].argmax())
                     f.write(json.dumps(example_with_prediction))
                     f.write('\n')
-
+                    if example_with_prediction['label'] != example_with_prediction['predicted_label']:
+                        errors.append(example_with_prediction)
+                        
+        with open(os.path.join(training_args.output_dir, 'incorrect_predictions.jsonl'), encoding='utf-8', mode='w') as f:
+            f.write(json.dumps(errors))
+            f.write('\n')
+                    
 
 if __name__ == "__main__":
     main()
